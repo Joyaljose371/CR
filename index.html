@@ -720,8 +720,32 @@ let deferredInstallPrompt=null;
 function appState(){
  return {students,studentDetails,omittedStudents,attendance,tasks,notices,groups,subjects,faculties,timetable};
 }
+
+// Firestore does not support arrays directly nested inside arrays.
+// Convert nested arrays into map objects before cloud upload, then restore them on download.
+function encodeCloudState(state){
+ const s=JSON.parse(JSON.stringify(state));
+ if(Array.isArray(s.groups)){
+   s.groups=s.groups.map((members,index)=>({index,members:Array.isArray(members)?members:[]}));
+ }
+ return s;
+}
+function decodeCloudState(state){
+ const s=JSON.parse(JSON.stringify(state||{}));
+ if(Array.isArray(s.groups)){
+   // New Firestore-safe format: [{index, members:[...]}]
+   if(s.groups.length===0 || (s.groups[0] && !Array.isArray(s.groups[0]) && Array.isArray(s.groups[0].members))){
+     s.groups=s.groups
+       .slice()
+       .sort((a,b)=>(a.index??0)-(b.index??0))
+       .map(g=>Array.isArray(g.members)?g.members:[]);
+   }
+ }
+ return s;
+}
 function applyAppState(s){
  if(!s)return;
+ s=decodeCloudState(s);
  if(Array.isArray(s.students))students=s.students;
  if(s.studentDetails)studentDetails=s.studentDetails;
  if(Array.isArray(s.omittedStudents))omittedStudents=s.omittedStudents;
@@ -971,26 +995,26 @@ async function syncWithCloud(force=false){
  try{
    setSyncStatus("online","Syncing…");
    const ref=userDoc(); const snap=await ref.get();
-   const localState=appState(); const localHash=stableHash(localState);
+   const localState=appState(); const cloudState=encodeCloudState(localState); const localHash=stableHash(localState);
    if(snap.exists && !force){
      const c=snap.data(); const cloudTime=Number(c.clientUpdatedAt||0);
      if(cloudTime>localUpdatedAt && !pendingCloudSync){
        applyAppState(c.state); localUpdatedAt=cloudTime; localStorage.setItem("cp_local_updated_at",String(localUpdatedAt));
-       lastCloudHash=stableHash(c.state); pendingCloudSync=false;localStorage.setItem("cp_pending_sync","0");
+       lastCloudHash=stableHash(decodeCloudState(c.state)); pendingCloudSync=false;localStorage.setItem("cp_pending_sync","0");
        if(lastSyncLabel)lastSyncLabel.textContent="Loaded newer cloud data";
        await loadBackups();updateCloudUI();return;
      }
    }
-   await ref.set({state:localState,clientUpdatedAt:localUpdatedAt||Date.now(),serverUpdatedAt:firebase.firestore.FieldValue.serverTimestamp(),schemaVersion:1},{merge:true});
+   await ref.set({state:cloudState,clientUpdatedAt:localUpdatedAt||Date.now(),serverUpdatedAt:firebase.firestore.FieldValue.serverTimestamp(),schemaVersion:2},{merge:true});
    pendingCloudSync=false;localStorage.setItem("cp_pending_sync","0");
    if(localHash!==lastCloudHash){await createBackup("Auto sync",localState,localHash);lastCloudHash=localHash}
    if(lastSyncLabel)lastSyncLabel.textContent="Synced " + new Date().toLocaleString();
    setSyncStatus("online","Cloud synced"); await loadBackups();
- }catch(e){console.warn(e);pendingCloudSync=true;localStorage.setItem("cp_pending_sync","1");setSyncStatus("error","Sync error · local safe")}
+ }catch(e){console.warn(e);pendingCloudSync=true;localStorage.setItem("cp_pending_sync","1");setSyncStatus("error","Sync error · local safe"); if(lastSyncLabel)lastSyncLabel.textContent=e?.message||"Sync failed"}
 }
 async function createBackup(label,state=appState(),hash=stableHash(appState())){
  if(!currentUser||!navigator.onLine)return;
- await backupsCol().add({label,hash,state,clientCreatedAt:Date.now(),createdAt:firebase.firestore.FieldValue.serverTimestamp()});
+ await backupsCol().add({label,hash,state:encodeCloudState(state),clientCreatedAt:Date.now(),createdAt:firebase.firestore.FieldValue.serverTimestamp(),schemaVersion:2});
  // Keep latest 30 versions.
  const old=await backupsCol().orderBy("clientCreatedAt","desc").get();
  old.docs.slice(30).forEach(d=>d.ref.delete().catch(()=>{}));
